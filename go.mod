@@ -1,6 +1,6 @@
 module github.com/user/go-mcp-from-openapi
 
-go 1.25.0
+go 1.26.1
 
 require github.com/modelcontextprotocol/go-sdk v1.4.1
 
