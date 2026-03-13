@@ -126,14 +126,14 @@ func FromOpenAPI(spec map[string]any, client *http.Client, name string, opts ...
 		}
 	}
 
-	baseURL := cfg.baseURL
-	if baseURL == "" {
-		baseURL = extractBaseURL(spec)
-	}
-
-	routes, err := parseRoutes(spec)
+	routes, specBaseURL, err := parseRoutes(spec)
 	if err != nil {
 		return nil, fmt.Errorf("parse openapi: %w", err)
+	}
+
+	baseURL := cfg.baseURL
+	if baseURL == "" {
+		baseURL = specBaseURL
 	}
 
 	s := mcp.NewServer(&mcp.Implementation{

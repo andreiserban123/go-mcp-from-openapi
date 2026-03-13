@@ -1,39 +1,25 @@
 package mcpopenapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/getkin/kin-openapi/openapi3"
 )
 
 // route is a parsed OpenAPI operation ready to become an MCP tool.
 type route struct {
 	path        string
 	method      string
-	name        string // MCP tool name
+	name        string
 	summary     string
 	description string
-	parameters  []*parameter
-	requestBody *requestBody
 	paramMap    map[string]paramLocation
-	properties  map[string]any // JSON Schema properties (flat, for MCP InputSchema)
-	required    []string       // required property names
-	baseURL     string
-}
-
-type parameter struct {
-	name        string
-	in          string // path, query, header, cookie
-	description string
-	required    bool
-	schema      map[string]any
-}
-
-type requestBody struct {
-	description string
-	required    bool
 	properties  map[string]any
-	requiredProps []string
+	required    []string
+	baseURL     string
 }
 
 // paramLocation tells the request builder where to put an argument.
@@ -42,200 +28,210 @@ type paramLocation struct {
 	apiName  string // original name in the OpenAPI spec
 }
 
-func parseRoutes(spec map[string]any) ([]*route, error) {
-	paths, ok := spec["paths"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("spec missing 'paths' field")
+// parseRoutes loads an OpenAPI 3.x document via kin-openapi and converts
+// every operation into a route. The second return value is the first server
+// URL found in the spec (empty string if none).
+func parseRoutes(spec map[string]any) ([]*route, string, error) {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal spec: %w", err)
+	}
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(data)
+	if err != nil {
+		return nil, "", fmt.Errorf("load spec: %w", err)
+	}
+
+	baseURL := ""
+	if len(doc.Servers) > 0 {
+		baseURL = strings.TrimRight(doc.Servers[0].URL, "/")
+	}
+
+	if doc.Paths == nil {
+		return nil, baseURL, nil
 	}
 
 	var routes []*route
-	// Deterministic method order
-	methodOrder := []string{"get", "post", "put", "patch", "delete", "head", "options"}
-
-	for path, pathItemAny := range paths {
-		pathItem, ok := pathItemAny.(map[string]any)
-		if !ok {
-			continue
+	for path, pathItem := range doc.Paths.Map() {
+		// Stable method order.
+		ops := []struct {
+			method string
+			op     *openapi3.Operation
+		}{
+			{"GET", pathItem.Get},
+			{"POST", pathItem.Post},
+			{"PUT", pathItem.Put},
+			{"PATCH", pathItem.Patch},
+			{"DELETE", pathItem.Delete},
+			{"HEAD", pathItem.Head},
+			{"OPTIONS", pathItem.Options},
 		}
-
-		// Path-level parameters inherited by all operations under this path
-		pathLevelParams := parseParameters(spec, pathItem["parameters"])
-
-		for _, method := range methodOrder {
-			opAny, ok := pathItem[method]
-			if !ok {
+		for _, entry := range ops {
+			if entry.op == nil {
 				continue
 			}
-			op, ok := opAny.(map[string]any)
-			if !ok {
-				continue
-			}
-			r := parseOperation(spec, path, strings.ToUpper(method), op, pathLevelParams)
+			r := buildRoute(path, entry.method, entry.op, pathItem)
 			routes = append(routes, r)
 		}
 	}
 
-	return routes, nil
+	return routes, baseURL, nil
 }
 
-func parseOperation(spec map[string]any, path, method string, op map[string]any, inherited []*parameter) *route {
+func buildRoute(path, method string, op *openapi3.Operation, pathItem *openapi3.PathItem) *route {
 	r := &route{
 		path:   path,
 		method: method,
 	}
 
-	r.summary, _ = op["summary"].(string)
-	r.description, _ = op["description"].(string)
+	r.summary = op.Summary
+	r.description = op.Description
 	if r.description == "" {
 		r.description = r.summary
 	}
+	r.name = toolName(op.OperationID, method, path)
 
-	operationID, _ := op["operationId"].(string)
-	r.name = toolName(operationID, method, path)
+	// Merge path-level parameters with operation-level ones.
+	// Operation-level takes precedence on name+in collision.
+	params := mergeOAPIParams(pathItem.Parameters, op.Parameters)
 
-	opParams := parseParameters(spec, op["parameters"])
-	r.parameters = mergeParameters(inherited, opParams)
+	properties := map[string]any{}
+	var required []string
+	paramMap := map[string]paramLocation{}
 
-	if rb, ok := op["requestBody"].(map[string]any); ok {
-		rb = resolveRef(spec, rb)
-		r.requestBody = parseRequestBody(spec, rb)
-	}
-
-	r.paramMap, r.properties, r.required = buildParamMap(r.parameters, r.requestBody)
-
-	return r
-}
-
-func parseParameters(spec map[string]any, paramsAny any) []*parameter {
-	paramsSlice, ok := paramsAny.([]any)
-	if !ok {
-		return nil
-	}
-
-	var params []*parameter
-	for _, pAny := range paramsSlice {
-		p, ok := pAny.(map[string]any)
-		if !ok {
+	for _, pRef := range params {
+		p := pRef.Value
+		if p == nil || p.In == "cookie" {
 			continue
 		}
-		p = resolveRef(spec, p)
+		flat := toToolName(p.Name)
+		paramMap[flat] = paramLocation{location: p.In, apiName: p.Name}
 
-		param := &parameter{
-			name: getString(p, "name"),
-			in:   getString(p, "in"),
+		prop := schemaRefToMap(p.Schema)
+		if p.Description != "" {
+			prop["description"] = p.Description
 		}
-		param.required, _ = p["required"].(bool)
-		param.description, _ = p["description"].(string)
-
-		if schema, ok := p["schema"].(map[string]any); ok {
-			param.schema = resolveRef(spec, schema)
-		}
-		if param.schema == nil {
-			param.schema = map[string]any{"type": "string"}
-		}
-
-		if param.name != "" && param.in != "" {
-			params = append(params, param)
+		properties[flat] = prop
+		if p.Required {
+			required = append(required, flat)
 		}
 	}
-	return params
-}
 
-func parseRequestBody(spec map[string]any, rb map[string]any) *requestBody {
-	result := &requestBody{}
-	result.description, _ = rb["description"].(string)
-	result.required, _ = rb["required"].(bool)
+	// Request body.
+	if op.RequestBody != nil && op.RequestBody.Value != nil {
+		rb := op.RequestBody.Value
 
-	content, ok := rb["content"].(map[string]any)
-	if !ok {
-		return result
-	}
-
-	// Prefer application/json, then fall back to first available content type
-	var mediaType map[string]any
-	for _, ct := range []string{"application/json", "application/x-www-form-urlencoded"} {
-		if mt, ok := content[ct].(map[string]any); ok {
-			mediaType = mt
-			break
-		}
-	}
-	if mediaType == nil {
-		for _, mt := range content {
-			if mtMap, ok := mt.(map[string]any); ok {
-				mediaType = mtMap
+		// Prefer application/json, fallback to first available content type.
+		var mediaType *openapi3.MediaType
+		for _, ct := range []string{"application/json", "application/x-www-form-urlencoded"} {
+			if mt, ok := rb.Content[ct]; ok {
+				mediaType = mt
 				break
 			}
 		}
-	}
-	if mediaType == nil {
-		return result
-	}
-
-	schema, ok := mediaType["schema"].(map[string]any)
-	if !ok {
-		return result
-	}
-	schema = resolveRef(spec, schema)
-	schema = flattenSchema(spec, schema)
-
-	result.properties, _ = schema["properties"].(map[string]any)
-	if req, ok := schema["required"].([]any); ok {
-		for _, r := range req {
-			if s, ok := r.(string); ok {
-				result.requiredProps = append(result.requiredProps, s)
+		if mediaType == nil {
+			for _, mt := range rb.Content {
+				mediaType = mt
+				break
 			}
+		}
+
+		if mediaType != nil && mediaType.Schema != nil && mediaType.Schema.Value != nil {
+			schema := mediaType.Schema.Value
+
+			// Flatten allOf/anyOf/oneOf into a single property map.
+			bodyProps, bodyRequired := flattenSchemaProps(schema)
+
+			for name, propRef := range bodyProps {
+				flat := toToolName(name)
+				if _, exists := paramMap[flat]; exists {
+					flat = "body_" + flat
+				}
+				paramMap[flat] = paramLocation{location: "body", apiName: name}
+				properties[flat] = schemaRefToMap(propRef)
+			}
+			for _, name := range bodyRequired {
+				flat := toToolName(name)
+				if _, exists := paramMap["body_"+flat]; exists {
+					flat = "body_" + flat
+				}
+				required = append(required, flat)
+			}
+		}
+	}
+
+	r.paramMap = paramMap
+	r.properties = properties
+	r.required = required
+	return r
+}
+
+// flattenSchemaProps collects all properties and required fields from a schema,
+// merging allOf / anyOf / oneOf sub-schemas recursively.
+func flattenSchemaProps(s *openapi3.Schema) (map[string]*openapi3.SchemaRef, []string) {
+	props := map[string]*openapi3.SchemaRef{}
+	var required []string
+
+	for name, ref := range s.Properties {
+		props[name] = ref
+	}
+	required = append(required, s.Required...)
+
+	for _, group := range [][]*openapi3.SchemaRef{s.AllOf, s.AnyOf, s.OneOf} {
+		for _, ref := range group {
+			if ref.Value == nil {
+				continue
+			}
+			subProps, subReq := flattenSchemaProps(ref.Value)
+			for k, v := range subProps {
+				props[k] = v
+			}
+			required = append(required, subReq...)
+		}
+	}
+
+	return props, required
+}
+
+// mergeOAPIParams merges path-level parameters with operation-level ones.
+// Operation-level params take precedence on name+in collision.
+func mergeOAPIParams(pathLevel, opLevel openapi3.Parameters) openapi3.Parameters {
+	result := make(openapi3.Parameters, len(pathLevel))
+	copy(result, pathLevel)
+	for _, op := range opLevel {
+		found := false
+		for i, pl := range result {
+			if pl.Value != nil && op.Value != nil &&
+				pl.Value.Name == op.Value.Name && pl.Value.In == op.Value.In {
+				result[i] = op
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, op)
 		}
 	}
 	return result
 }
 
-func buildParamMap(params []*parameter, rb *requestBody) (map[string]paramLocation, map[string]any, []string) {
-	properties := map[string]any{}
-	var required []string
-	paramMap := map[string]paramLocation{}
-
-	for _, p := range params {
-		if p.in == "cookie" {
-			continue
-		}
-		flat := toToolName(p.name)
-		paramMap[flat] = paramLocation{location: p.in, apiName: p.name}
-
-		prop := shallowCopy(p.schema)
-		if p.description != "" {
-			prop["description"] = p.description
-		}
-		properties[flat] = prop
-
-		if p.required {
-			required = append(required, flat)
-		}
+// schemaRefToMap converts a resolved *openapi3.SchemaRef to map[string]any
+// for use in MCP tool InputSchema. Marshals the resolved Value (not the $ref
+// string) so that all schema details survive.
+func schemaRefToMap(ref *openapi3.SchemaRef) map[string]any {
+	if ref == nil || ref.Value == nil {
+		return map[string]any{"type": "string"}
 	}
-
-	if rb != nil {
-		for name, schemAny := range rb.properties {
-			schema, ok := schemAny.(map[string]any)
-			if !ok {
-				schema = map[string]any{"type": "string"}
-			}
-			flat := toToolName(name)
-			// Avoid collision with path/query/header params
-			if _, exists := paramMap[flat]; exists {
-				flat = "body_" + flat
-			}
-			paramMap[flat] = paramLocation{location: "body", apiName: name}
-			properties[flat] = shallowCopy(schema)
-		}
-		for _, name := range rb.requiredProps {
-			flat := toToolName(name)
-			if _, exists := paramMap["body_"+flat]; exists {
-				flat = "body_" + flat
-			}
-			required = append(required, flat)
-		}
+	data, err := json.Marshal(ref.Value)
+	if err != nil {
+		return map[string]any{"type": "string"}
 	}
-
-	return paramMap, properties, required
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return map[string]any{"type": "string"}
+	}
+	return m
 }
 
 // toolName generates a valid MCP tool name from operationId or method+path.
@@ -267,109 +263,4 @@ func toToolName(s string) string {
 	s = invalidCharsRe.ReplaceAllString(s, "_")
 	s = strings.Trim(s, "_")
 	return s
-}
-
-// extractBaseURL reads the first server URL from the spec.
-func extractBaseURL(spec map[string]any) string {
-	servers, ok := spec["servers"].([]any)
-	if !ok || len(servers) == 0 {
-		return ""
-	}
-	first, ok := servers[0].(map[string]any)
-	if !ok {
-		return ""
-	}
-	u, _ := first["url"].(string)
-	return strings.TrimRight(u, "/")
-}
-
-// resolveRef follows a JSON Pointer $ref within the same document.
-func resolveRef(spec, obj map[string]any) map[string]any {
-	ref, ok := obj["$ref"].(string)
-	if !ok {
-		return obj
-	}
-	if !strings.HasPrefix(ref, "#/") {
-		return obj // external $refs not supported
-	}
-	parts := strings.Split(strings.TrimPrefix(ref, "#/"), "/")
-	current := spec
-	for _, part := range parts {
-		part = strings.ReplaceAll(part, "~1", "/")
-		part = strings.ReplaceAll(part, "~0", "~")
-		next, ok := current[part].(map[string]any)
-		if !ok {
-			return obj
-		}
-		current = next
-	}
-	return resolveRef(spec, current) // recurse in case target also has $ref
-}
-
-// flattenSchema merges allOf sub-schemas into a single object schema.
-func flattenSchema(spec map[string]any, schema map[string]any) map[string]any {
-	allOf, ok := schema["allOf"].([]any)
-	if !ok {
-		return schema
-	}
-	merged := map[string]any{"type": "object", "properties": map[string]any{}}
-	var required []string
-	for _, sub := range allOf {
-		subMap, ok := sub.(map[string]any)
-		if !ok {
-			continue
-		}
-		subMap = resolveRef(spec, subMap)
-		subMap = flattenSchema(spec, subMap)
-		if props, ok := subMap["properties"].(map[string]any); ok {
-			for k, v := range props {
-				merged["properties"].(map[string]any)[k] = v
-			}
-		}
-		if req, ok := subMap["required"].([]any); ok {
-			for _, r := range req {
-				if s, ok := r.(string); ok {
-					required = append(required, s)
-				}
-			}
-		}
-	}
-	if len(required) > 0 {
-		merged["required"] = required
-	}
-	return merged
-}
-
-// mergeParameters merges path-level params with operation-level ones.
-// Operation-level params take precedence on name+in collision.
-func mergeParameters(pathLevel, opLevel []*parameter) []*parameter {
-	result := make([]*parameter, len(pathLevel))
-	copy(result, pathLevel)
-	for _, op := range opLevel {
-		found := false
-		for i, pl := range result {
-			if pl.name == op.name && pl.in == op.in {
-				result[i] = op
-				found = true
-				break
-			}
-		}
-		if !found {
-			result = append(result, op)
-		}
-	}
-	return result
-}
-
-func getString(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
-}
-
-func shallowCopy(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
