@@ -190,6 +190,36 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 	return srv.ListenAndServe()
 }
 
+// ParseSpecJSON parses a raw JSON byte slice (or string cast to []byte) into
+// the map form expected by FromOpenAPI.
+//
+// Use this when you already have the spec as a JSON string, e.g.:
+//
+//	spec, err := mcpopenapi.ParseSpecJSON([]byte(myJSONString))
+//	srv, err := mcpopenapi.FromOpenAPI(spec, client, "My API")
+func ParseSpecJSON(data []byte) (map[string]any, error) {
+	var spec map[string]any
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return nil, fmt.Errorf("parse spec json: %w", err)
+	}
+	return spec, nil
+}
+
+// FromOpenAPIJSON is a convenience wrapper for callers who have the OpenAPI
+// spec as a raw JSON []byte (or a string cast to []byte) instead of a
+// pre-decoded map.
+//
+//	srv, err := mcpopenapi.FromOpenAPIJSON([]byte(myJSONString), client, "My API",
+//	    mcpopenapi.WithBaseURL("https://api.example.com"),
+//	)
+func FromOpenAPIJSON(data []byte, client *http.Client, name string, opts ...Option) (*Server, error) {
+	spec, err := ParseSpecJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	return FromOpenAPI(spec, client, name, opts...)
+}
+
 // FetchSpec is a convenience helper that downloads and decodes an OpenAPI JSON
 // specification from the given URL.
 func FetchSpec(specURL string) (map[string]any, error) {

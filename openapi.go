@@ -238,7 +238,11 @@ func schemaRefToMap(ref *openapi3.SchemaRef) map[string]any {
 // MCP tool names may only contain: a-z A-Z 0-9 _ - .
 func toolName(operationID, method, path string) string {
 	if operationID != "" {
-		return toToolName(operationID)
+		name := toToolName(operationID)
+		if len(name) > 128 {
+			name = name[:128]
+		}
+		return name
 	}
 	parts := []string{strings.ToLower(method)}
 	for _, seg := range strings.Split(path, "/") {
