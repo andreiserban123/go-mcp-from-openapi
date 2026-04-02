@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"gopkg.in/yaml.v3"
 )
 
 // basicAuthTransport injects HTTP Basic Auth into every request.
@@ -234,4 +235,31 @@ func FetchSpec(specURL string) (map[string]any, error) {
 		return nil, fmt.Errorf("decode spec: %w", err)
 	}
 	return spec, nil
+}
+
+// ParseSpecYAML parses a raw YAML byte slice into the map form expected by
+// FromOpenAPI.
+//
+//	spec, err := mcpopenapi.ParseSpecYAML(yamlBytes)
+//	srv, err := mcpopenapi.FromOpenAPI(spec, client, "My API")
+func ParseSpecYAML(data []byte) (map[string]any, error) {
+	var spec map[string]any
+	if err := yaml.Unmarshal(data, &spec); err != nil {
+		return nil, fmt.Errorf("parse spec yaml: %w", err)
+	}
+	return spec, nil
+}
+
+// FromOpenAPIYAML is a convenience wrapper for callers who have the OpenAPI
+// spec as a raw YAML []byte instead of a pre-decoded map.
+//
+//	srv, err := mcpopenapi.FromOpenAPIYAML(yamlBytes, client, "My API",
+//	    mcpopenapi.WithBaseURL("https://api.example.com"),
+//	)
+func FromOpenAPIYAML(data []byte, client *http.Client, name string, opts ...Option) (*Server, error) {
+	spec, err := ParseSpecYAML(data)
+	if err != nil {
+		return nil, err
+	}
+	return FromOpenAPI(spec, client, name, opts...)
 }

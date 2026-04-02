@@ -1,0 +1,195 @@
+openapi: "3.0.0"
+info:
+  title: Bookstore API
+  version: "1.0.0"
+  description: A simple bookstore REST API
+
+servers:
+  - url: https://api.bookstore.example.com/v1
+
+paths:
+  /books:
+    get:
+      operationId: listBooks
+      summary: List all books
+      description: Returns a paginated list of books, with optional filtering by genre or author.
+      parameters:
+        - name: genre
+          in: query
+          required: false
+          description: Filter by genre (e.g. fiction, sci-fi)
+          schema:
+            type: string
+        - name: author
+          in: query
+          required: false
+          description: Filter by author name
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          description: Page number (1-based)
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          required: false
+          description: Number of results per page (max 100)
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A list of books
+
+    post:
+      operationId: createBook
+      summary: Add a new book
+      description: Creates a new book entry in the catalogue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - author
+                - isbn
+              properties:
+                title:
+                  type: string
+                  description: Full title of the book
+                author:
+                  type: string
+                  description: Author full name
+                isbn:
+                  type: string
+                  description: ISBN-13
+                genre:
+                  type: string
+                  description: Genre tag
+                price:
+                  type: number
+                  description: Retail price in USD
+      responses:
+        "201":
+          description: Book created
+
+  /books/{bookId}:
+    parameters:
+      - name: bookId
+        in: path
+        required: true
+        description: Unique book identifier
+        schema:
+          type: string
+
+    get:
+      operationId: getBook
+      summary: Get a book by ID
+      responses:
+        "200":
+          description: Book details
+        "404":
+          description: Not found
+
+    put:
+      operationId: updateBook
+      summary: Update a book
+      description: Replaces all mutable fields on a book record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                author:
+                  type: string
+                genre:
+                  type: string
+                price:
+                  type: number
+      responses:
+        "200":
+          description: Updated
+
+    delete:
+      operationId: deleteBook
+      summary: Delete a book
+      responses:
+        "204":
+          description: Deleted
+
+  /books/{bookId}/reviews:
+    parameters:
+      - name: bookId
+        in: path
+        required: true
+        description: Book to review
+        schema:
+          type: string
+
+    get:
+      operationId: listReviews
+      summary: List reviews for a book
+      parameters:
+        - name: sort
+          in: query
+          required: false
+          description: Sort order — "newest" or "rating"
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of reviews
+
+    post:
+      operationId: createReview
+      summary: Submit a review
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - rating
+                - text
+              properties:
+                rating:
+                  type: integer
+                  description: Rating from 1 to 5
+                text:
+                  type: string
+                  description: Review body
+                reviewer:
+                  type: string
+                  description: Reviewer display name
+      responses:
+        "201":
+          description: Review submitted
+
+  /search:
+    get:
+      operationId: searchBooks
+      summary: Full-text search across books
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query
+          schema:
+            type: string
+        - name: X-Request-Id
+          in: header
+          required: false
+          description: Optional trace ID for debugging
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Search results
